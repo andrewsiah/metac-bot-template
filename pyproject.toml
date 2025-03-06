@@ -1,3 +1,4 @@
+# Keep Poetry configuration for Poetry users
 [tool.poetry]
 name = "metac-bot-template"
 version = "0.1.0"
@@ -17,11 +18,37 @@ python-dotenv = "^1.0.1"
 forecasting-tools = "^0.2.13"
 matplotlib = "^3.10.0"
 
-
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.29.5"
 
+# Use a simpler build system for UV
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+# Project metadata for UV
+[project]
+name = "metac-bot-template"
+version = "0.1.0"
+description = "Metaculus forecasting bot template"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    "python-decouple>=3.8",
+    "requests>=2.32.3",
+    "asknews>=0.9.1",
+    "numpy>=1.26.0",
+    "openai>=1.57.4",
+    "python-dotenv>=1.0.1",
+    "forecasting-tools>=0.2.13",
+    "matplotlib>=3.10.0",
+    "typeguard>=2.13.0",
+    "litellm>=0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ipykernel>=6.29.5",
+]
 
