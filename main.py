@@ -2,8 +2,10 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime
-from typing import Literal
+from pathlib import Path
+from typing import Literal, Dict, Optional
 
 from forecasting_tools import (
     AskNewsSearcher,
@@ -24,8 +26,23 @@ from forecasting_tools import (
 )
 import typeguard
 
+# Create logs directory if it doesn't exist
+logs_dir = Path("logs")
+logs_dir.mkdir(exist_ok=True)
+
+# Create a timestamp for this run
+timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+run_log_dir = logs_dir / timestamp
+run_log_dir.mkdir(exist_ok=True)
+
+# Configure root logger to write to a main log file
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(run_log_dir / "main.log"),
+        logging.StreamHandler()  # Keep console output
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -33,6 +50,66 @@ logger = logging.getLogger(__name__)
 litellm_logger = logging.getLogger("LiteLLM")
 litellm_logger.setLevel(logging.WARNING)
 litellm_logger.propagate = False
+
+# Dictionary to store question-specific loggers
+question_loggers: Dict[str, logging.Logger] = {}
+
+def extract_question_id(url: str) -> Optional[str]:
+    """Extract the question ID from a Metaculus URL."""
+    # Try the standard format first
+    match = re.search(r'questions/(\d+)', url)
+    if match:
+        return match.group(1)
+    
+    # Try alternative formats if needed
+    match = re.search(r'/(\d+)/', url)
+    if match:
+        return match.group(1)
+    
+    logger.warning(f"Could not extract question ID from URL: {url}")
+    return None
+
+def get_question_logger(question: MetaculusQuestion) -> logging.Logger:
+    """Get or create a logger for a specific question."""
+    question_id = extract_question_id(question.page_url)
+    if not question_id:
+        logger.warning(f"Could not extract question ID from URL: {question.page_url}")
+        return logger  # Fall back to main logger if ID can't be extracted
+    
+    logger.info(f"Getting logger for question ID: {question_id}, URL: {question.page_url}")
+    
+    if question_id not in question_loggers:
+        # Create a new logger for this question
+        q_logger = logging.getLogger(f"question_{question_id}")
+        q_logger.setLevel(logging.INFO)
+        
+        # Create a file handler for this question
+        log_file = run_log_dir / f"question_{question_id}.log"
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        
+        # Add the handler to the logger
+        q_logger.addHandler(file_handler)
+        q_logger.propagate = False  # Don't propagate to parent logger
+        
+        # Store the logger
+        question_loggers[question_id] = q_logger
+        logger.info(f"Created new logger for question ID: {question_id}, log file: {log_file}")
+        
+        # Log initial question information
+        q_logger.info(f"===== QUESTION INFORMATION =====")
+        q_logger.info(f"Question ID: {question_id}")
+        q_logger.info(f"Question URL: {question.page_url}")
+        q_logger.info(f"Question text: {question.question_text}")
+        q_logger.info(f"Background info: {question.background_info}")
+        q_logger.info(f"Resolution criteria: {question.resolution_criteria}")
+        q_logger.info(f"Question type: {question.__class__.__name__}")
+        q_logger.info(f"Created at: {timestamp}")
+        q_logger.info(f"===============================")
+    else:
+        logger.info(f"Using existing logger for question ID: {question_id}")
+    
+    return question_loggers[question_id]
 
 class Q1TemplateBot(ForecastBot):
     """
@@ -71,6 +148,7 @@ class Q1TemplateBot(ForecastBot):
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
+            q_logger = get_question_logger(question)
             research = ""
             if os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET"):
                 research = AskNewsSearcher().get_formatted_news(question.question_text)
@@ -82,7 +160,7 @@ class Q1TemplateBot(ForecastBot):
                 research = await self._call_perplexity(question.question_text, use_open_router=True)
             else:
                 research = ""
-            logger.info(f"Found Research for {question.page_url}:\n{research}")
+            q_logger.info(f"Found Research for {question.page_url}:\n{research}")
             return research
 
     async def _call_perplexity(self, question: str, use_open_router: bool = False) -> str:
@@ -105,15 +183,25 @@ class Q1TemplateBot(ForecastBot):
             model=model_name,
             temperature=0.1,
         )
+        
+        # Log model invocation details - using main logger since this isn't attached to a specific question yet
+        logger.info(f"Invoking {model_name} for research with prompt: {prompt[:200]}...")
+        
         response = await model.invoke(prompt)
+        logger.info(f"Received response from {model_name} (length: {len(response)})")
         return response
 
     async def _call_exa_smart_searcher(self, question: str) -> str:
         """
         SmartSearcher is a custom class that is a wrapper around a search on Exa.ai
         """
+        logger.info(f"Initializing SmartSearcher for question: {question[:200]}...")
+        
+        model = self._get_final_decision_llm()
+        logger.info(f"Using model {model.model} for SmartSearcher")
+        
         searcher = SmartSearcher(
-            model=self._get_final_decision_llm(),
+            model=model,
             temperature=0,
             num_searches_to_run=2,
             num_sites_per_search=10,
@@ -125,19 +213,24 @@ class Q1TemplateBot(ForecastBot):
             "would resolve Yes or No based on current information. You do not produce forecasts yourself."
             f"\n\nThe question is: {question}"
         )  # You can ask the searcher to filter by date, exclude/include a domain, and run specific searches for finding sources vs finding highlights within a source
+        
+        logger.info(f"Invoking SmartSearcher with prompt: {prompt[:200]}...")
         response = await searcher.invoke(prompt)
+        logger.info(f"Received response from SmartSearcher (length: {len(response)})")
+        
         return response
 
     def _get_final_decision_llm(self) -> GeneralLlm:
         model = None
-        if os.getenv("OPENAI_API_KEY"):
+        if os.getenv("OPENROUTER_API_KEY"):
+            model = GeneralLlm(model="openrouter/deepseek/deepseek-r1:free", temperature=0.3)
+        elif os.getenv("METACULUS_TOKEN"):
+            model = GeneralLlm(model="metaculus/gpt-4o", temperature=0.3)
+        elif os.getenv("OPENAI_API_KEY"):
             model = GeneralLlm(model="gpt-4o", temperature=0.3)
         elif os.getenv("ANTHROPIC_API_KEY"):
             model = GeneralLlm(model="claude-3-5-sonnet-20241022", temperature=0.3)
-        elif os.getenv("OPENROUTER_API_KEY"):
-            model = GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.3)
-        elif os.getenv("METACULUS_TOKEN"):
-            model = GeneralLlm(model="metaculus/gpt-4o", temperature=0.3)
+        
         else:
             raise ValueError("No API key for final_decision_llm found")
         return model
@@ -178,11 +271,19 @@ class Q1TemplateBot(ForecastBot):
             The last thing you write is your final answer as: "Probability: ZZ%", 0-100
             """
         )
-        reasoning = await self._get_final_decision_llm().invoke(prompt)
+        q_logger = get_question_logger(question)
+        q_logger.info(f"Invoking model for binary forecast with prompt: {prompt[:200]}...")
+        model = self._get_final_decision_llm()
+        q_logger.info(f"Using model {model.model} for binary forecast")
+        
+        reasoning = await model.invoke(prompt)
+        q_logger.info(f"Received response from model (length: {len(reasoning)})")
+        
+        q_logger.info(f"Extracting binary prediction from response...")
         prediction: float = PredictionExtractor.extract_last_percentage_value(
             reasoning, max_prediction=1, min_prediction=0
         )
-        logger.info(
+        q_logger.info(
             f"Forecasted {question.page_url} as {prediction} with reasoning:\n{reasoning}"
         )
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
@@ -227,13 +328,21 @@ class Q1TemplateBot(ForecastBot):
             Option_N: Probability_N
             """
         )
-        reasoning = await self._get_final_decision_llm().invoke(prompt)
+        q_logger = get_question_logger(question)
+        q_logger.info(f"Invoking model for multiple choice forecast with prompt: {prompt[:200]}...")
+        model = self._get_final_decision_llm()
+        q_logger.info(f"Using model {model.model} for multiple choice forecast")
+        
+        reasoning = await model.invoke(prompt)
+        q_logger.info(f"Received response from model (length: {len(reasoning)})")
+        
+        q_logger.info(f"Extracting multiple choice prediction from response...")
         prediction: PredictedOptionList = (
             PredictionExtractor.extract_option_list_with_percentage_afterwards(
                 reasoning, question.options
             )
         )
-        logger.info(
+        q_logger.info(
             f"Forecasted {question.page_url} as {prediction} with reasoning:\n{reasoning}"
         )
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
@@ -241,6 +350,7 @@ class Q1TemplateBot(ForecastBot):
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
+        q_logger = get_question_logger(question)
         upper_bound_message, lower_bound_message = (
             self._create_upper_and_lower_bound_messages(question)
         )
@@ -293,13 +403,20 @@ class Q1TemplateBot(ForecastBot):
             "
             """
         )
-        reasoning = await self._get_final_decision_llm().invoke(prompt)
+        q_logger.info(f"Invoking model for numeric forecast with prompt: {prompt[:200]}...")
+        model = self._get_final_decision_llm()
+        q_logger.info(f"Using model {model.model} for numeric forecast")
+        
+        reasoning = await model.invoke(prompt)
+        q_logger.info(f"Received response from model (length: {len(reasoning)})")
+        
+        q_logger.info(f"Extracting numeric distribution from response...")
         prediction: NumericDistribution = (
             PredictionExtractor.extract_numeric_distribution_from_list_of_percentile_number_and_probability(
                 reasoning, question
             )
         )
-        logger.info(
+        q_logger.info(
             f"Forecasted {question.page_url} as {prediction.declared_percentiles} with reasoning:\n{reasoning}"
         )
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
@@ -332,7 +449,23 @@ def summarize_reports(forecast_reports: list[ForecastReport | BaseException]) ->
         report.errors for report in valid_reports if report.errors
     ]
 
+    logger.info(f"Summarizing {len(valid_reports)} valid reports, {len(exceptions)} exceptions")
+    
     for report in valid_reports:
+        question_id = extract_question_id(report.question.page_url)
+        logger.info(f"Processing report for question ID: {question_id}, URL: {report.question.page_url}")
+        
+        if question_id:
+            if question_id in question_loggers:
+                q_logger = question_loggers[question_id]
+                logger.info(f"Found logger for question ID: {question_id}")
+            else:
+                logger.warning(f"No logger found for question ID: {question_id}, falling back to main logger")
+                q_logger = logger
+        else:
+            logger.warning(f"Could not extract question ID from URL: {report.question.page_url}")
+            q_logger = logger
+        
         question_summary = clean_indents(f"""
             URL: {report.question.page_url}
             Errors: {report.errors}
@@ -340,12 +473,14 @@ def summarize_reports(forecast_reports: list[ForecastReport | BaseException]) ->
             {report.summary}
             ---------------------------------------------------------
         """)
-        logger.info(question_summary)
+        q_logger.info(question_summary)
+        logger.info(f"Completed forecast for question {question_id}: {report.question.page_url}")
 
     if exceptions:
-        raise RuntimeError(
-            f"{len(exceptions)} errors occurred while forecasting: {exceptions}"
-        )
+        error_msg = f"{len(exceptions)} errors occurred while forecasting: {exceptions}"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
+    
     if minor_exceptions:
         logger.error(
             f"{len(minor_exceptions)} minor exceptions occurred while forecasting: {minor_exceptions}"
@@ -370,6 +505,10 @@ if __name__ == "__main__":
         "quarterly_cup",
         "test_questions",
     ], "Invalid run mode"
+
+    logger.info(f"Starting forecasting run in {run_mode} mode at {timestamp}")
+    logger.info(f"Logs will be saved to {run_log_dir}")
+    logger.info(f"Individual question logs will be created in {run_log_dir} as question_[ID].log files")
 
     template_bot = Q1TemplateBot(
         research_reports_per_question=1,
@@ -416,4 +555,9 @@ if __name__ == "__main__":
         )
     forecast_reports = typeguard.check_type(forecast_reports, list[ForecastReport | BaseException])
     summarize_reports(forecast_reports)
+
+    # Add final log message to both main and all question loggers
+    logger.info(f"Completed forecasting run in {run_mode} mode")
+    for q_logger in question_loggers.values():
+        q_logger.info(f"Completed forecasting run in {run_mode} mode")
 
