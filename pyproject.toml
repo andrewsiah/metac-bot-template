@@ -17,6 +17,7 @@ openai = "^1.57.4"
 python-dotenv = "^1.0.1"
 forecasting-tools = "^0.2.13"
 matplotlib = "^3.10.0"
+wandb = "^0.16.5"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.29.5"
@@ -45,6 +46,7 @@ dependencies = [
     "matplotlib>=3.10.0",
     "typeguard>=2.13.0",
     "litellm>=0.1.0",
+    "wandb>=0.16.5",
 ]
 
 [project.optional-dependencies]

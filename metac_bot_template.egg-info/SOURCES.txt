@@ -1,0 +1,7 @@
+README.md
+pyproject.toml
+metac_bot_template.egg-info/PKG-INFO
+metac_bot_template.egg-info/SOURCES.txt
+metac_bot_template.egg-info/dependency_links.txt
+metac_bot_template.egg-info/requires.txt
+metac_bot_template.egg-info/top_level.txt
