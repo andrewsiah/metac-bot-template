@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import re
+import wandb
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Dict, Optional
@@ -53,6 +54,32 @@ litellm_logger.propagate = False
 
 # Dictionary to store question-specific loggers
 question_loggers: Dict[str, logging.Logger] = {}
+
+# Initialize wandb
+def init_wandb(run_mode: str):
+    """Initialize wandb with the appropriate project and run name."""
+    wandb_api_key = os.getenv("WANDB_API_KEY")
+    if not wandb_api_key:
+        logger.warning("WANDB_API_KEY not found in environment variables. WandB logging disabled.")
+        return False
+    
+    project_name = os.getenv("WANDB_PROJECT", "metaculus-forecasting-bot")
+    run_name = f"{run_mode}-{timestamp}"
+    
+    try:
+        wandb.init(
+            project=project_name,
+            name=run_name,
+            config={
+                "run_mode": run_mode,
+                "timestamp": timestamp,
+            }
+        )
+        logger.info(f"WandB initialized with project: {project_name}, run: {run_name}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to initialize WandB: {e}")
+        return False
 
 def extract_question_id(url: str) -> Optional[str]:
     """Extract the question ID from a Metaculus URL."""
@@ -106,6 +133,20 @@ def get_question_logger(question: MetaculusQuestion) -> logging.Logger:
         q_logger.info(f"Question type: {question.__class__.__name__}")
         q_logger.info(f"Created at: {timestamp}")
         q_logger.info(f"===============================")
+        
+        # Log to wandb if initialized
+        if wandb.run is not None:
+            # Create a wandb Table for text data
+            info_table = wandb.Table(columns=["Field", "Value"])
+            info_table.add_data("Question ID", question_id)
+            info_table.add_data("URL", question.page_url)
+            info_table.add_data("Question Text", question.question_text)
+            info_table.add_data("Background Info", question.background_info)
+            info_table.add_data("Resolution Criteria", question.resolution_criteria)
+            info_table.add_data("Question Type", question.__class__.__name__)
+            info_table.add_data("Created At", timestamp)
+            
+            wandb.log({f"question_{question_id}/info": info_table})
     else:
         logger.info(f"Using existing logger for question ID: {question_id}")
     
@@ -161,6 +202,17 @@ class Q1TemplateBot(ForecastBot):
             else:
                 research = ""
             q_logger.info(f"Found Research for {question.page_url}:\n{research}")
+            
+            # Log research to wandb
+            question_id = extract_question_id(question.page_url)
+            if wandb.run is not None and question_id:
+                # Create a wandb Table for research text
+                research_table = wandb.Table(columns=["Research"])
+                research_table.add_data(research)
+                wandb.log({
+                    f"question_{question_id}/research": research_table
+                })
+                
             return research
 
     async def _call_perplexity(self, question: str, use_open_router: bool = False) -> str:
@@ -280,13 +332,42 @@ class Q1TemplateBot(ForecastBot):
         q_logger.info(f"Received response from model (length: {len(reasoning)})")
         
         q_logger.info(f"Extracting binary prediction from response...")
-        prediction: float = PredictionExtractor.extract_last_percentage_value(
-            reasoning, max_prediction=1, min_prediction=0
-        )
-        q_logger.info(
-            f"Forecasted {question.page_url} as {prediction} with reasoning:\n{reasoning}"
-        )
-        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+        try:
+            prediction: float = PredictionExtractor.extract_last_percentage_value(
+                reasoning, max_prediction=1, min_prediction=0
+            )
+            q_logger.info(
+                f"Forecasted {question.page_url} as {prediction} with reasoning:\n{reasoning}"
+            )
+            
+            # Log to wandb
+            question_id = extract_question_id(question.page_url)
+            if wandb.run is not None and question_id:
+                # Create a wandb Table for reasoning text
+                reasoning_table = wandb.Table(columns=["Reasoning"])
+                reasoning_table.add_data(reasoning)
+                
+                wandb.log({
+                    f"question_{question_id}/binary_prediction": float(prediction),
+                    f"question_{question_id}/reasoning": reasoning_table
+                })
+                
+            return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+        except Exception as e:
+            q_logger.error(f"Error extracting binary prediction: {e}")
+            q_logger.error(f"Full reasoning text: {reasoning}")
+            
+            # Log error to wandb
+            question_id = extract_question_id(question.page_url)
+            if wandb.run is not None and question_id:
+                error_table = wandb.Table(columns=["Error", "Reasoning"])
+                error_table.add_data(str(e), reasoning)
+                wandb.log({
+                    f"question_{question_id}/extraction_error": error_table
+                })
+            
+            # Re-raise the exception to be handled by the caller
+            raise
 
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
@@ -337,15 +418,55 @@ class Q1TemplateBot(ForecastBot):
         q_logger.info(f"Received response from model (length: {len(reasoning)})")
         
         q_logger.info(f"Extracting multiple choice prediction from response...")
-        prediction: PredictedOptionList = (
-            PredictionExtractor.extract_option_list_with_percentage_afterwards(
-                reasoning, question.options
+        try:
+            prediction: PredictedOptionList = (
+                PredictionExtractor.extract_option_list_with_percentage_afterwards(
+                    reasoning, question.options
+                )
             )
-        )
-        q_logger.info(
-            f"Forecasted {question.page_url} as {prediction} with reasoning:\n{reasoning}"
-        )
-        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+            q_logger.info(
+                f"Forecasted {question.page_url} as {prediction} with reasoning:\n{reasoning}"
+            )
+            
+            # Log to wandb
+            question_id = extract_question_id(question.page_url)
+            if wandb.run is not None and question_id:
+                # Convert prediction to dict for easier visualization in wandb
+                # Handle PredictedOption objects properly by extracting their values
+                prediction_dict = {}
+                for i, (option, prob) in enumerate(zip(question.options, prediction)):
+                    # Handle the case where prob might be a tuple
+                    if isinstance(prob, tuple):
+                        prob_value = prob[0] if prob else 0.0
+                    else:
+                        prob_value = prob
+                    prediction_dict[f"option_{i}_{option[:20]}"] = float(prob_value)
+                
+                # Create a wandb Table for reasoning text
+                reasoning_table = wandb.Table(columns=["Reasoning"])
+                reasoning_table.add_data(reasoning)
+                
+                wandb.log({
+                    f"question_{question_id}/multiple_choice_prediction": prediction_dict,
+                    f"question_{question_id}/reasoning": reasoning_table
+                })
+                
+            return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+        except Exception as e:
+            q_logger.error(f"Error extracting multiple choice prediction: {e}")
+            q_logger.error(f"Full reasoning text: {reasoning}")
+            
+            # Log error to wandb
+            question_id = extract_question_id(question.page_url)
+            if wandb.run is not None and question_id:
+                error_table = wandb.Table(columns=["Error", "Reasoning"])
+                error_table.add_data(str(e), reasoning)
+                wandb.log({
+                    f"question_{question_id}/extraction_error": error_table
+                })
+            
+            # Re-raise the exception to be handled by the caller
+            raise
 
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str
@@ -411,15 +532,58 @@ class Q1TemplateBot(ForecastBot):
         q_logger.info(f"Received response from model (length: {len(reasoning)})")
         
         q_logger.info(f"Extracting numeric distribution from response...")
-        prediction: NumericDistribution = (
-            PredictionExtractor.extract_numeric_distribution_from_list_of_percentile_number_and_probability(
-                reasoning, question
+        try:
+            prediction: NumericDistribution = (
+                PredictionExtractor.extract_numeric_distribution_from_list_of_percentile_number_and_probability(
+                    reasoning, question
+                )
             )
-        )
-        q_logger.info(
-            f"Forecasted {question.page_url} as {prediction.declared_percentiles} with reasoning:\n{reasoning}"
-        )
-        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+            q_logger.info(
+                f"Forecasted {question.page_url} as {prediction.declared_percentiles} with reasoning:\n{reasoning}"
+            )
+            
+            # Log to wandb
+            question_id = extract_question_id(question.page_url)
+            if wandb.run is not None and question_id:
+                # Convert prediction to dict for easier visualization in wandb
+                # Handle NumericDistribution objects properly
+                percentiles_dict = {}
+                
+                # Check if declared_percentiles is a list or a dict
+                if hasattr(prediction.declared_percentiles, 'items'):
+                    # It's a dict
+                    for p, v in prediction.declared_percentiles.items():
+                        percentiles_dict[f"percentile_{p}"] = float(v)
+                else:
+                    # It's a list or some other iterable
+                    for i, v in enumerate(prediction.declared_percentiles):
+                        percentiles_dict[f"percentile_{i}"] = float(v)
+                
+                # Create a wandb Table for reasoning text
+                reasoning_table = wandb.Table(columns=["Reasoning"])
+                reasoning_table.add_data(reasoning)
+                
+                wandb.log({
+                    f"question_{question_id}/numeric_prediction": percentiles_dict,
+                    f"question_{question_id}/reasoning": reasoning_table
+                })
+                
+            return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+        except Exception as e:
+            q_logger.error(f"Error extracting numeric distribution: {e}")
+            q_logger.error(f"Full reasoning text: {reasoning}")
+            
+            # Log error to wandb
+            question_id = extract_question_id(question.page_url)
+            if wandb.run is not None and question_id:
+                error_table = wandb.Table(columns=["Error", "Reasoning"])
+                error_table.add_data(str(e), reasoning)
+                wandb.log({
+                    f"question_{question_id}/extraction_error": error_table
+                })
+            
+            # Re-raise the exception to be handled by the caller
+            raise
 
     def _create_upper_and_lower_bound_messages(
         self, question: NumericQuestion
@@ -451,6 +615,14 @@ def summarize_reports(forecast_reports: list[ForecastReport | BaseException]) ->
 
     logger.info(f"Summarizing {len(valid_reports)} valid reports, {len(exceptions)} exceptions")
     
+    # Log summary to wandb
+    if wandb.run is not None:
+        wandb.log({
+            "summary/valid_reports": len(valid_reports),
+            "summary/exceptions": len(exceptions),
+            "summary/minor_exceptions": len(minor_exceptions)
+        })
+    
     for report in valid_reports:
         question_id = extract_question_id(report.question.page_url)
         logger.info(f"Processing report for question ID: {question_id}, URL: {report.question.page_url}")
@@ -475,16 +647,38 @@ def summarize_reports(forecast_reports: list[ForecastReport | BaseException]) ->
         """)
         q_logger.info(question_summary)
         logger.info(f"Completed forecast for question {question_id}: {report.question.page_url}")
+        
+        # Log final summary to wandb
+        if wandb.run is not None and question_id:
+            # Create a wandb Table for summary text
+            summary_table = wandb.Table(columns=["Summary"])
+            summary_table.add_data(report.summary)
+            
+            # Create a wandb Table for errors text if any
+            if report.errors:
+                errors_table = wandb.Table(columns=["Errors"])
+                errors_table.add_data(str(report.errors))
+                wandb.log({
+                    f"question_{question_id}/final_summary": summary_table,
+                    f"question_{question_id}/errors": errors_table
+                })
+            else:
+                wandb.log({
+                    f"question_{question_id}/final_summary": summary_table
+                })
 
     if exceptions:
         error_msg = f"{len(exceptions)} errors occurred while forecasting: {exceptions}"
         logger.error(error_msg)
+        if wandb.run is not None:
+            wandb.log({"errors": error_msg})
         raise RuntimeError(error_msg)
     
     if minor_exceptions:
-        logger.error(
-            f"{len(minor_exceptions)} minor exceptions occurred while forecasting: {minor_exceptions}"
-        )
+        minor_error_msg = f"{len(minor_exceptions)} minor exceptions occurred while forecasting: {minor_exceptions}"
+        logger.error(minor_error_msg)
+        if wandb.run is not None:
+            wandb.log({"minor_errors": minor_error_msg})
 
 
 if __name__ == "__main__":
@@ -498,6 +692,24 @@ if __name__ == "__main__":
         default="tournament",
         help="Specify the run mode (default: tournament)",
     )
+    parser.add_argument(
+        "--predictions_per_report",
+        type=int,
+        default=5,
+        help="Number of predictions per research report",
+    )
+    parser.add_argument(
+        "--max_retries",
+        type=int,
+        default=5,
+        help="Maximum number of retries for failed API calls",
+    )
+    parser.add_argument(
+        "--retry_delay",
+        type=int,
+        default=3,
+        help="Delay between retries in seconds",
+    )
     args = parser.parse_args()
     run_mode: Literal["tournament", "quarterly_cup", "test_questions"] = args.mode
     assert run_mode in [
@@ -509,10 +721,17 @@ if __name__ == "__main__":
     logger.info(f"Starting forecasting run in {run_mode} mode at {timestamp}")
     logger.info(f"Logs will be saved to {run_log_dir}")
     logger.info(f"Individual question logs will be created in {run_log_dir} as question_[ID].log files")
+    
+    # Initialize wandb
+    wandb_enabled = init_wandb(run_mode)
+    if wandb_enabled:
+        logger.info("WandB logging enabled")
+    else:
+        logger.warning("WandB logging disabled")
 
     template_bot = Q1TemplateBot(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        predictions_per_research_report=args.predictions_per_report,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
         folder_to_save_reports_to=None,
@@ -560,4 +779,9 @@ if __name__ == "__main__":
     logger.info(f"Completed forecasting run in {run_mode} mode")
     for q_logger in question_loggers.values():
         q_logger.info(f"Completed forecasting run in {run_mode} mode")
+    
+    # Finish wandb run
+    if wandb.run is not None:
+        wandb.log({"status": "completed"})
+        wandb.finish()
 

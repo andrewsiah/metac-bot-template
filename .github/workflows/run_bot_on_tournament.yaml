@@ -41,7 +41,7 @@ jobs:
           # Create logs directory
           mkdir -p logs
           # Run the bot with retry parameters
-          poetry run python main.py --predictions_per_report 5 --max_retries 5 --retry_delay 3
+          poetry run python main.py --mode tournament --predictions_per_report 5 --max_retries 5 --retry_delay 3
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
@@ -54,3 +54,4 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
