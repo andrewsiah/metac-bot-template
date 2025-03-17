@@ -249,7 +249,7 @@ class Q1TemplateBot(ForecastBot):
         """
         logger.info(f"Initializing SmartSearcher for question: {question[:200]}...")
         
-        model = self._get_final_decision_llm()
+        model = await self._get_working_llm()
         logger.info(f"Using model {model.model} for SmartSearcher")
         
         searcher = SmartSearcher(
@@ -272,20 +272,57 @@ class Q1TemplateBot(ForecastBot):
         
         return response
 
-    def _get_final_decision_llm(self) -> GeneralLlm:
-        model = None
-        if os.getenv("OPENROUTER_API_KEY"):
-            model = GeneralLlm(model="openrouter/deepseek/deepseek-r1:free", temperature=0.3)
-        elif os.getenv("METACULUS_TOKEN"):
-            model = GeneralLlm(model="metaculus/gpt-4o", temperature=0.3)
-        elif os.getenv("OPENAI_API_KEY"):
-            model = GeneralLlm(model="gpt-4o", temperature=0.3)
-        elif os.getenv("ANTHROPIC_API_KEY"):
-            model = GeneralLlm(model="claude-3-5-sonnet-20241022", temperature=0.3)
+    async def _test_model_availability(self, model: GeneralLlm) -> bool:
+        """Test if a model is available and not rate limited."""
+        try:
+            # Use a minimal prompt to test if the model is responsive
+            test_prompt = "Return only the word 'OK' if you can process this message."
+            response = await model.invoke(test_prompt)
+            logger.info(f"Model test response: {response[:20]}...")
+            return True
+        except Exception as e:
+            if "rate limit" in str(e).lower():
+                logger.warning(f"Rate limit detected for model {model.model}: {str(e)}")
+            else:
+                logger.warning(f"Model {model.model} test failed: {str(e)}")
+            return False
+
+    async def _get_working_llm(self, question_logger=None) -> GeneralLlm:
+        """
+        Asynchronously find a working LLM with fallback mechanism.
+        This should be called from async methods when ready to use the model.
+        """
+        log = question_logger or logger
         
-        else:
-            raise ValueError("No API key for final_decision_llm found")
-        return model
+        # Define models to try in order of preference
+        model_configs = [
+            ("METACULUS_TOKEN", "metaculus/claude-3-7-sonnet-latest", 0.3),
+            ("OPENROUTER_API_KEY", "openrouter/deepseek/deepseek-r1", 0.3),
+            ("OPENAI_API_KEY", "gpt-4o", 0.3),
+            ("ANTHROPIC_API_KEY", "claude-3-5-sonnet-20241022", 0.3),
+        ]
+        
+        last_error = None
+        for env_var, model_name, temp in model_configs:
+            if os.getenv(env_var):
+                try:
+                    log.info(f"Attempting to use model: {model_name}")
+                    model = GeneralLlm(model=model_name, temperature=temp)
+                    
+                    # Test if the model is available
+                    if await self._test_model_availability(model):
+                        log.info(f"Successfully connected to model: {model_name}")
+                        return model
+                    else:
+                        log.warning(f"Model {model_name} failed availability test, trying next model")
+                except Exception as e:
+                    log.warning(f"Failed to use {model_name}: {str(e)}")
+                    last_error = e
+        
+        # If we've tried all models and none worked
+        error_msg = f"All models failed. Last error: {str(last_error) if last_error else 'No models available'}"
+        log.error(error_msg)
+        raise ValueError(error_msg)
 
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
@@ -325,7 +362,7 @@ class Q1TemplateBot(ForecastBot):
         )
         q_logger = get_question_logger(question)
         q_logger.info(f"Invoking model for binary forecast with prompt: {prompt[:200]}...")
-        model = self._get_final_decision_llm()
+        model = await self._get_working_llm(question_logger=q_logger)
         q_logger.info(f"Using model {model.model} for binary forecast")
         
         reasoning = await model.invoke(prompt)
@@ -402,16 +439,24 @@ class Q1TemplateBot(ForecastBot):
 
             You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
 
-            The last thing you write is your final probabilities for the N options in this order {question.options} as:
-            Option_A: Probability_A
-            Option_B: Probability_B
-            ...
-            Option_N: Probability_N
+            Formatting Instructions for your final answer:
+            - Write each option on a new line
+            - Use ONLY numbers (0-100) for probabilities, without the % symbol
+            - Use this EXACT format (where XX is a number between 0 and 100):
+
+            {question.options[0]}: XX
+            {question.options[1] if len(question.options) > 1 else ""}: XX
+            {question.options[2] if len(question.options) > 2 else ""}: XX
+            {question.options[3] if len(question.options) > 3 else ""}: XX
+            {question.options[4] if len(question.options) > 4 else ""}: XX
+
+            The last thing you write is your final answer using the EXACT format above.
+            Make sure the probabilities sum to 100.
             """
         )
         q_logger = get_question_logger(question)
         q_logger.info(f"Invoking model for multiple choice forecast with prompt: {prompt[:200]}...")
-        model = self._get_final_decision_llm()
+        model = await self._get_working_llm(question_logger=q_logger)
         q_logger.info(f"Using model {model.model} for multiple choice forecast")
         
         reasoning = await model.invoke(prompt)
@@ -502,6 +547,16 @@ class Q1TemplateBot(ForecastBot):
             - Please notice the units requested (e.g. whether you represent a number as 1,000,000 or 1m).
             - Never use scientific notation.
             - Always start with a smaller number (more negative if negative) and then increase from there
+            - For your final answer, write ONLY the number for each percentile, without the word "Percentile" or any other text
+            - Each number should be on its own line
+            - Use this EXACT format (replace XX with actual numbers):
+
+            10: XX
+            20: XX
+            40: XX
+            60: XX
+            80: XX
+            90: XX
 
             Before answering you write:
             (a) The time left until the outcome to the question is known.
@@ -513,19 +568,11 @@ class Q1TemplateBot(ForecastBot):
 
             You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
 
-            The last thing you write is your final answer as:
-            "
-            Percentile 10: XX
-            Percentile 20: XX
-            Percentile 40: XX
-            Percentile 60: XX
-            Percentile 80: XX
-            Percentile 90: XX
-            "
+            The last thing you write is your final answer using the EXACT format specified above.
             """
         )
         q_logger.info(f"Invoking model for numeric forecast with prompt: {prompt[:200]}...")
-        model = self._get_final_decision_llm()
+        model = await self._get_working_llm(question_logger=q_logger)
         q_logger.info(f"Using model {model.model} for numeric forecast")
         
         reasoning = await model.invoke(prompt)
